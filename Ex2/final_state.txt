@@ -1,0 +1,8 @@
+volume_fraction 0.45000000000000001
+domain_volume 0.35999999999999999
+target_volume 0.16200000000000001
+steps 154
+energy -1.7420117468224752
+lambda1 0.017061018684487686
+volume_error 0
+termination dissipation_converged
