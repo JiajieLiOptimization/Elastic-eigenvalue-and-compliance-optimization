@@ -1,0 +1,611 @@
+// Example 3: phase-field optimization, version 1018.
+load "iovtk"
+include "getARGV.idp"
+verbosity = 0;
+
+macro grad(u) [dx(u), dy(u)] //
+macro divergence(ux, uy) (dx(ux) + dy(uy)) //
+macro strain(ux, uy, vx, vy) (dx(ux) * dx(vx) + dy(uy) * dy(vy) + 0.5 * (dy(ux) + dx(uy)) * (dy(vx) + dx(vy))) //
+
+func real weightedVolume(real[int] &value, real[int] &weight)
+{
+  real sum = 0.0, correction = 0.0;
+  for (int i = 0; i < value.n; ++i)
+  {
+    real term = weight[i] * value[i] - correction;
+    real next = sum + term;
+    correction = (next - sum) - term;
+    sum = next;
+  }
+  return sum;
+}
+
+// Lumped L2 projection onto the nodal box, fixed values and volume.
+func real projectVolume(real[int] &seed, real[int] &weight,
+                       real[int] &freeNode, real[int] &fixedValue,
+                       real target, real[int] &value, real initialGuess)
+{
+  real multiplier = initialGuess;
+  int n = seed.n;
+  real fixedVolume = 0.0, freeVolume = 0.0;
+  real lower = 1.0e100, upper = -1.0e100;
+  for (int i = 0; i < n; ++i)
+  {
+    if (freeNode[i] > 0.5)
+    {
+      freeVolume += weight[i];
+      lower = min(lower, seed[i] - 1.0);
+      upper = max(upper, seed[i]);
+    }
+    else
+    {
+      value[i] = fixedValue[i];
+      fixedVolume += weight[i] * value[i];
+    }
+  }
+  real goal = target - fixedVolume;
+  if (goal <= 0.0 || goal >= freeVolume)
+  {
+    for (int i = 0; i < n; ++i)
+      if (freeNode[i] > 0.5) value[i] = (goal <= 0.0 ? 0.0 : 1.0);
+    multiplier = (goal <= 0.0 ? upper : lower);
+  }
+  else
+  {
+    // This tolerance controls only the accuracy of the volume multiplier.
+    real tolerance = 2.0e-16 * max(1.0, max(abs(target), freeVolume));
+    real trial = min(upper, max(lower, multiplier));
+    for (int iteration = 0; iteration < 80; ++iteration)
+    {
+      for (int i = 0; i < n; ++i)
+        if (freeNode[i] > 0.5) value[i] = min(1.0, max(0.0, seed[i] - trial));
+      real residual = weightedVolume(value, weight) - target;
+      multiplier = trial;
+      if (abs(residual) <= tolerance) break;
+      if (residual > 0.0) lower = trial;
+      else upper = trial;
+      trial = lower + 0.5 * (upper - lower);
+    }
+  }
+  return multiplier;
+}
+
+func real sigmoid(real value)
+{
+  if (value >= 0.0) return 1.0 / (1.0 + exp(-value));
+  real exponential = exp(value);
+  return exponential / (1.0 + exponential);
+}
+
+// Parameters.
+real dt = getARGV("-dt", 2.0e-4);
+real epsilon = getARGV("-epsilon", 1.5e-3);
+real alphaEig = getARGV("-alphaEig", 30.0);
+real alphaComp = getARGV("-alphaComp", 10.0);
+real volumeFraction = getARGV("-volumeFraction", 0.3);
+real S0 = getARGV("-S0", 1.0), S1 = getARGV("-S1", 1.0);
+real extrapCap = getARGV("-cap", 1.0);
+real extrapInitial = getARGV("-theta0", 1.05);
+real extrapIncrease = getARGV("-inc", 1.2), extrapDecrease = getARGV("-dec", 0.5);
+// Shared sufficient-decrease parameter for extrapolation and backtracking.
+real armijoSigma = getARGV("-sigma", 0.5);
+real backtrackFactor = getARGV("-iota", 0.5);
+int maxBacktracks = getARGV("-maxBacktracks", 60);
+int maxSteps = getARGV("-maxSteps", 0);
+real extrapMid = getARGV("-sigmoidMid", 26.0), extrapWidth = getARGV("-sigmoidWidth", 2.5);
+real dissipationTol = getARGV("-dissipationTol", 1.0e-3);
+real eigTol = getARGV("-eigTol", 1.0e-6);
+int eigMaxit = getARGV("-eigMaxit", 300), eigNcv = getARGV("-eigNcv", 8);
+int vtkEvery = getARGV("-vtkEvery", 5);
+real pdasTol = 1.0e-6, pdasC = 5.0e-3;
+real penalty = 1.0e30;
+// Retain eigenvalue diagnostics for the compliance-only Ex3B case.
+bool needEigen = true;
+bool needCompliance = (alphaComp > 0.0);
+assert(dt > 0.0 && epsilon > 0.0 && S0 >= 0.0 && S1 >= 0.0);
+assert(alphaEig >= 0.0 && alphaComp >= 0.0 && alphaEig + alphaComp > 0.0);
+assert(volumeFraction > 0.0 && volumeFraction < 1.0 && dissipationTol > 0.0);
+assert(extrapCap >= 1.0 && extrapInitial >= 1.0 && extrapIncrease > 1.0);
+assert(extrapDecrease > 0.0 && extrapDecrease < 1.0 && armijoSigma > 0.0 && armijoSigma <= 1.0);
+assert(backtrackFactor > 0.0 && backtrackFactor < 1.0 && maxBacktracks >= 0 && maxSteps >= 0);
+assert(extrapWidth > 0.0 && eigTol > 0.0 && eigMaxit > 0 && eigNcv > 2 && vtkEvery >= 0);
+int nn = getARGV("-nn", 45);
+assert(nn > 0);
+real loadRadius = getARGV("-loadRadius", 0.03), solidRadius = getARGV("-solidRadius", 0.04);
+assert(loadRadius > 0.0 && solidRadius >= 0.0);
+
+// Mesh and finite element fields.
+int clampLabel = 1;
+int freeLabel = 0;
+
+real capsuleRadius = 0.5;
+real capsuleLeftX = 0.5;
+real capsuleRightX = 1.5;
+real capsuleY0 = 0.5;
+
+real fixedHeightRatio = 0.75;
+
+real capsuleFixAngle = asin(fixedHeightRatio);
+
+border capsuleRightFixedUpper(t = 0.0, capsuleFixAngle)
+{
+  x = capsuleRightX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = clampLabel;
+};
+
+border capsuleRightUpperFree(t = capsuleFixAngle, 0.5 * pi)
+{
+  x = capsuleRightX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = freeLabel;
+};
+
+border capsuleTop(t = 0.0, 1.0)
+{
+  x = capsuleRightX - (capsuleRightX - capsuleLeftX) * t;
+  y = capsuleY0 + capsuleRadius;
+  label = freeLabel;
+};
+
+border capsuleLeftUpperFree(t = 0.5 * pi, pi - capsuleFixAngle)
+{
+  x = capsuleLeftX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = freeLabel;
+};
+
+border capsuleLeftFixed(t = pi - capsuleFixAngle, pi + capsuleFixAngle)
+{
+  x = capsuleLeftX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = clampLabel;
+};
+
+border capsuleLeftLowerFree(t = pi + capsuleFixAngle, 1.5 * pi)
+{
+  x = capsuleLeftX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = freeLabel;
+};
+
+border capsuleBottom(t = 0.0, 1.0)
+{
+  x = capsuleLeftX + (capsuleRightX - capsuleLeftX) * t;
+  y = capsuleY0 - capsuleRadius;
+  label = freeLabel;
+};
+
+border capsuleRightLowerFree(t = 1.5 * pi, 2.0 * pi - capsuleFixAngle)
+{
+  x = capsuleRightX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = freeLabel;
+};
+
+border capsuleRightFixedLower(t = 2.0 * pi - capsuleFixAngle, 2.0 * pi)
+{
+  x = capsuleRightX + capsuleRadius * cos(t);
+  y = capsuleY0 + capsuleRadius * sin(t);
+  label = clampLabel;
+};
+
+mesh Th = buildmesh(
+    capsuleRightFixedUpper(1 * nn)
+  + capsuleRightUpperFree(1 * nn)
+  + capsuleTop(2 * nn)
+  + capsuleLeftUpperFree(1 * nn)
+  + capsuleLeftFixed(2 * nn)
+  + capsuleLeftLowerFree(1 * nn)
+  + capsuleBottom(2 * nn)
+  + capsuleRightLowerFree(1 * nn)
+  + capsuleRightFixedLower(1 * nn)
+);
+fespace Vh(Th, [P1, P1]);
+fespace Sh(Th, P1);
+fespace Q0h(Th, P0);
+fespace Q2h(Th, P2);
+fespace Screenh(Th, [P0, P0, P0]);
+Sh phi, phiOld, predictor, direction, pdasPrevious;
+Sh one = 1.0, solidMask = 0.0, freeMask = 1.0;
+Sh activeLower, activeUpper, boundMultiplier, supportNodes;
+Vh [u1, u2], [oldU1, oldU2], [rayU1, rayU2];
+Q0h eigenStrain, screenEigenStrain;
+Q2h modeSquared, screenModeSquared, interpolationDerivative;
+real lambda1 = 0.0, lambda2 = 0.0, compliance = 0.0;
+real nu = 0.3, mu = 1.0 / (2.0 * (1.0 + nu));
+real lame = nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+real materialFloor = 0.01, densityFloor = 0.01;
+Vh [w1, w2], [rayW1, rayW2];
+Q0h complianceStrain, screenComplianceStrain;
+Sh loadMask, force;
+[u1, u2] = [0.0, 0.0];
+[w1, w2] = [0.0, 0.0];
+varf supportMarker(a, b) = on(clampLabel, a = 1.0);
+supportNodes[] = supportMarker(0, Sh, tgv = 1);
+solidMask = (solidRadius > 0.0) * ((x - 1.0)^2 + (y - 0.5)^2 <= solidRadius^2);
+freeMask = 1.0 - solidMask;
+
+// Constant phase operators and material-dependent state forms.
+varf phaseMass(a, b) = int2d(Th)(a * b);
+varf phaseStiffness(a, b) = int2d(Th)(grad(a)' * grad(b));
+matrix M0 = phaseMass(Sh, Sh), K0 = phaseStiffness(Sh, Sh);
+int n = Sh.ndof;
+real[int] volumeWeight(n);
+varf volumeForm(a, b) = int2d(Th)(b);
+volumeWeight = volumeForm(0, Sh);
+real domainVolume = weightedVolume(one[], volumeWeight);
+real targetVolume = volumeFraction * domainVolume;
+matrix phaseA = (1.0 + dt * S0) * M0 + dt * (epsilon + S1) * K0;
+matrix phaseOld = (1.0 + dt * S0) * M0 + dt * S1 * K0;
+varf elasticStiffness([u1, u2], [v1, v2])
+  = int2d(Th)((materialFloor + (1.0 - materialFloor) * phi^3) * (2.0 * mu * strain(u1, u2, v1, v2) + lame * divergence(u1, u2) * divergence(v1, v2)))
+  + on(clampLabel, u1 = 0.0, u2 = 0.0);
+varf eigenMass([u1, u2], [v1, v2]) = int2d(Th)((densityFloor + (1.0 - densityFloor) * phi^3) * (u1 * v1 + u2 * v2));
+loadMask = ((x - 1.0)^2 + (y - 0.5)^2 <= loadRadius^2);
+real loadArea = int2d(Th)(loadMask);
+assert(loadArea > 0.0);
+force = -loadMask / loadArea;
+varf staticLoad([u1, u2], [v1, v2]) = int2d(Th)(force * v2);
+real[int] loadVector = staticLoad(0, Vh);
+varf sensitivity(a, b) = int2d(Th)(interpolationDerivative * ((1.0 - materialFloor) * alphaEig * eigenStrain - alphaEig * (1.0 - densityFloor) * lambda1 * modeSquared + (1.0 - materialFloor) * alphaComp * complianceStrain) * b);
+varf screenIntegrals([aC, aS, aM], [bC, bS, bM])
+  = int2d(Th)((materialFloor + (1.0 - materialFloor) * phi^3) * (screenComplianceStrain * bC + screenEigenStrain * bS) + (densityFloor + (1.0 - densityFloor) * phi^3) * screenModeSquared * bM);
+
+// Initial feasible design.
+func seed = 0.5 + 0.2 * cos(4.0 * pi * x) * cos(8.0 * pi * y);
+phi = seed;
+real initialMultiplier = 0.0, predictorMultiplier = 0.0, trialMultiplier = 0.0;
+real[int] raw = phi[];
+initialMultiplier = projectVolume(raw, volumeWeight, freeMask[], solidMask[], targetVolume, phi[], initialMultiplier);
+real[int] eigenvalue(2), eigenResidual(Vh.ndof);
+Vh[int] [mode1, mode2](2);
+real energy;
+{
+  matrix initialStiffness = elasticStiffness(Vh, Vh, solver = sparsesolver);
+  if (needEigen)
+  {
+    matrix massMatrix = eigenMass(Vh, Vh);
+    int converged = EigenValue(initialStiffness, massMatrix, sym = true, nev = 2,
+      value = eigenvalue, vector = mode1, tol = eigTol,
+      maxit = eigMaxit, ncv = eigNcv, which = "LM");
+    assert(converged >= 2);
+    int firstMode = (eigenvalue[0] <= eigenvalue[1] ? 0 : 1);
+    [u1, u2] = [mode1[firstMode], mode2[firstMode]];
+    lambda1 = eigenvalue[firstMode];
+    lambda2 = eigenvalue[1 - firstMode];
+    assert(lambda1 > 1.0e-14);
+    real massNorm = sqrt(int2d(Th)((densityFloor + (1.0 - densityFloor) * phi^3) * (u1 * u1 + u2 * u2)));
+    assert(massNorm > 1.0e-30);
+    [u1, u2] = [u1 / massNorm, u2 / massNorm];
+  }
+  if (needCompliance)
+  {
+    w1[] = initialStiffness^-1 * loadVector;
+    compliance = int2d(Th)(force * w2);
+  }
+  energy = -alphaEig * lambda1 + alphaComp * compliance
+    + int2d(Th)(0.5 * epsilon * grad(phi)' * grad(phi) + (0.5 / epsilon) * phi * (1.0 - phi));
+}
+
+int[int] vtkOrder = [1];
+savevtk("rho_initial.vtk", Th, phi, dataname = "rho", order = vtkOrder, bin = 0);
+ofstream stateFile("state_history.txt"), convergenceFile("convergence_history.txt");
+ofstream extrapolationFile("extrapolation_history.txt");
+ofstream timingFile("timing_history.txt");
+ofstream eigenvalueFile("eigenvalue_history.txt");
+eigenvalueFile.precision(16);
+eigenvalueFile << "iter lambda1 lambda2 gap_abs gap_rel" << endl;
+eigenvalueFile << 0 << " ";
+if (needEigen)
+  eigenvalueFile << lambda1 << " " << lambda2 << " " << lambda2 - lambda1
+    << " " << (lambda2 - lambda1) / lambda1 << endl;
+else eigenvalueFile << "nan nan nan nan" << endl;
+eigenvalueFile.flush;
+timingFile.precision(10);
+timingFile << "iter assembly state_solve phase_update safeguard diagnostics_io eigen compliance sensitivity phase_predictor diagnostics io other total cumulative_total state_evaluations eigen_solves compliance_solves" << endl;
+timingFile.flush;
+stateFile.precision(16);
+convergenceFile.precision(16);
+extrapolationFile.precision(16);
+stateFile << "iter energy compliance lambda1 volume_error rho_min rho_max eigen_computed compliance_computed" << endl;
+convergenceFile << "iter energy_drop dissipation sqrt_dissipation_relative stop_below stop_count" << endl;
+extrapolationFile << "iter theta_requested theta_accepted trial_status S0 S1 backtrack_step backtracks" << endl;
+stateFile << 0 << " " << energy << " ";
+if (needCompliance) stateFile << compliance; else stateFile << "nan";
+stateFile << " ";
+if (needEigen) stateFile << lambda1; else stateFile << "nan";
+stateFile << " " << weightedVolume(phi[], volumeWeight) - targetVolume << " "
+  << phi[].min << " " << phi[].max << " " << needEigen << " " << needCompliance << endl;
+convergenceFile << "0 0 0 1 0 0" << endl;
+extrapolationFile << "0 1 1 0 " << S0 << " " << S1 << " 1 0" << endl;
+
+real oldEnergy = energy, initialDissipation = -1.0, cumulativeTime = 0.0;
+real extrapMemory = min(extrapCap, extrapInitial);
+int step = 0, stopCount = 0;
+bool zeroIncrement = false;
+real[int] rhs(n), diagonal(n), activeFree(n), activeDiagonal(n), constrainedRhs(n), volumeRhs(n);
+real[int] phiZero(n), volumeDirection(n), kktResidual(n), difference(n), massDifference(n);
+real[int] phaseIncrementMass(n), phaseIncrementStiffness(n), phaseVectorMass(n), phaseVectorStiffness(n);
+
+// Keep the predictor, dt and dissipation fixed during all trial evaluations.
+while (stopCount < 3 && (maxSteps == 0 || step < maxSteps))
+{
+  real iterationStart = clock(), timer = iterationStart;
+  real timeAssembly = 0.0, timeEigen = 0.0, timeCompliance = 0.0;
+  real timeSensitivity = 0.0, timePhase = 0.0, timeSafeguard = 0.0;
+  real timeDiagnostics = 0.0, timeIO = 0.0;
+  int stateEvaluations = 0, eigenSolves = 0, complianceSolves = 0;
+  phiOld = phi;
+  [oldU1, oldU2] = [u1, u2];
+  interpolationDerivative = 3.0 * phi^2;
+  eigenStrain = 2.0 * mu * strain(u1, u2, u1, u2) + lame * divergence(u1, u2)^2;
+  modeSquared = u1 * u1 + u2 * u2;
+  complianceStrain = 2.0 * mu * strain(w1, w2, w1, w2) + lame * divergence(w1, w2)^2;
+  real[int] sensitivityVector = sensitivity(0, Sh);
+  timeSensitivity = clock() - timer;
+
+  timer = clock();
+  rhs = phaseOld * phiOld[];
+  difference = 0.5 * one[] - phiOld[];
+  massDifference = M0 * difference;
+  rhs -= (dt / epsilon) * massDifference;
+  rhs += dt * sensitivityVector;
+  diagonal = phaseA.diag;
+  activeLower = freeMask * (phi < 1.0e-8);
+  activeUpper = max(freeMask * (phi > 1.0 - 1.0e-8), solidMask);
+  pdasPrevious = phi;
+  for (int iteration = 0; iteration < 100; ++iteration)
+  {
+    activeFree = 1.0;
+    activeFree -= activeLower[];
+    activeFree -= activeUpper[];
+    matrix pdasMatrix = phaseA;
+    activeDiagonal = penalty * activeLower[];
+    activeDiagonal += penalty * activeUpper[];
+    activeDiagonal += activeFree .* diagonal;
+    pdasMatrix.diag = activeDiagonal;
+    set(pdasMatrix, solver = GMRES);
+    constrainedRhs = penalty * activeUpper[];
+    constrainedRhs += activeFree .* rhs;
+    volumeRhs = activeFree .* volumeWeight;
+    phiZero = pdasMatrix^-1 * constrainedRhs;
+    volumeDirection = pdasMatrix^-1 * volumeRhs;
+    real denominator = weightedVolume(volumeDirection, volumeWeight);
+    assert(abs(denominator) > 1.0e-30);
+    real volumeMultiplier = (weightedVolume(phiZero, volumeWeight) - targetVolume) / denominator;
+    phi[] = phiZero - volumeMultiplier * volumeDirection;
+    phi = solidMask + freeMask * phi;
+    kktResidual = phaseA * phi[];
+    kktResidual -= rhs;
+    kktResidual += volumeMultiplier * volumeWeight;
+    boundMultiplier[] = kktResidual;
+    activeLower = freeMask * (boundMultiplier - pdasC * phi > 0.0);
+    activeUpper = max(freeMask * (boundMultiplier + pdasC * (1.0 - phi) < 0.0), solidMask);
+    difference = phi[] - pdasPrevious[];
+    massDifference = M0 * difference;
+    if (sqrt(max(difference' * massDifference, 0.0)) < pdasTol)
+    {
+      break;
+    }
+    pdasPrevious = phi;
+  }
+  raw = phi[];
+  predictorMultiplier = projectVolume(raw, volumeWeight, freeMask[], solidMask[], targetVolume, phi[], predictorMultiplier);
+  predictor = phi;
+  direction[] = predictor[] - phiOld[];
+  direction[] = freeMask[] .* direction[];
+  phaseIncrementMass = M0 * direction[];
+  phaseIncrementStiffness = K0 * direction[];
+  real dissipation = (direction[]' * phaseIncrementMass) / dt
+    + 0.5 * epsilon * (direction[]' * phaseIncrementStiffness);
+  assert(dissipation >= 0.0);
+  timePhase = clock() - timer;
+  if (dissipation == 0.0)
+  {
+    phi = phiOld;
+    zeroIncrement = true;
+    break;
+  }
+  real safeguardStart = clock();
+  if (initialDissipation < 0.0) initialDissipation = dissipation;
+  real normalizedDissipation = sqrt(dissipation / initialDissipation);
+
+  real scheduleCap = 1.0 + (extrapCap - 1.0) * sigmoid((step + 1 - extrapMid) / extrapWidth);
+  real requestedFactor = min(extrapMemory, scheduleCap), acceptedFactor = 1.0;
+  int trialStatus = 0;
+  real backtrackStep = 1.0;
+  int backtrackCount = 0;
+  bool extrapAccepted = false;
+  bool makeTrial = (requestedFactor > 1.0 + 1.0e-14);
+  if (makeTrial)
+  {
+    raw = phiOld[] + requestedFactor * direction[];
+    trialMultiplier = projectVolume(raw, volumeWeight, freeMask[], solidMask[], targetVolume, phi[], trialMultiplier);
+  }
+
+  // The lower bound can reject a trial; acceptance uses its true energy.
+  if (makeTrial)
+  {
+    phaseVectorMass = M0 * phi[];
+    phaseVectorStiffness = K0 * phi[];
+    real lowerBound = 0.5 * epsilon * (phi[]' * phaseVectorStiffness)
+      + (0.5 / epsilon) * (volumeWeight' * phi[] - phi[]' * phaseVectorMass);
+    [rayU1, rayU2] = [oldU1 * (1.0 - supportNodes), oldU2 * (1.0 - supportNodes)];
+    screenEigenStrain = 2.0 * mu * strain(rayU1, rayU2, rayU1, rayU2) + lame * divergence(rayU1, rayU2)^2;
+    screenModeSquared = rayU1 * rayU1 + rayU2 * rayU2;
+    [rayW1, rayW2] = [w1 * (1.0 - supportNodes), w2 * (1.0 - supportNodes)];
+    screenComplianceStrain = 2.0 * mu * strain(rayW1, rayW2, rayW1, rayW2) + lame * divergence(rayW1, rayW2)^2;
+    real[int] screenVector = screenIntegrals(0, Screenh);
+    real[int] totals(3);
+    totals = 0.0;
+    for (int i = 0; i < screenVector.n; i += 3)
+    {
+      totals[0] += screenVector[i + 0];
+      totals[1] += screenVector[i + 1];
+      totals[2] += screenVector[i + 2];
+    }
+    lowerBound += alphaComp * max(0.0, 2.0 * int2d(Th)(force * rayW2) - totals[0]);
+    if (alphaEig > 0.0)
+    {
+      assert(totals[2] > 1.0e-30);
+      lowerBound -= alphaEig * totals[1] / totals[2];
+    }
+    if (lowerBound > oldEnergy - armijoSigma * dissipation)
+    {
+      makeTrial = false;
+      phi = predictor;
+      trialStatus = -3;
+    }
+  }
+
+  // Each branch evaluates its candidate once. Accepted states carry forward.
+  // Keep dt, predictor, direction and dissipation fixed throughout the search.
+  while (true)
+  {
+    ++stateEvaluations;
+    timer = clock();
+    matrix stateStiffness = elasticStiffness(Vh, Vh, solver = sparsesolver);
+    timeAssembly += clock() - timer;
+    if (needEigen)
+    {
+      timer = clock();
+      matrix massMatrix = eigenMass(Vh, Vh);
+      timeAssembly += clock() - timer;
+      timer = clock();
+      eigenResidual = oldU1[];
+      int converged = EigenValue(stateStiffness, massMatrix, sym = true, nev = 2,
+        value = eigenvalue, vector = mode1, resid = eigenResidual, tol = eigTol,
+        maxit = eigMaxit, ncv = eigNcv, which = "LM");
+      assert(converged >= 2);
+      int firstMode = (eigenvalue[0] <= eigenvalue[1] ? 0 : 1);
+      [u1, u2] = [mode1[firstMode], mode2[firstMode]];
+      lambda1 = eigenvalue[firstMode];
+      lambda2 = eigenvalue[1 - firstMode];
+      assert(lambda1 > 1.0e-14);
+      real massNorm = sqrt(int2d(Th)((densityFloor + (1.0 - densityFloor) * phi^3) * (u1 * u1 + u2 * u2)));
+      assert(massNorm > 1.0e-30);
+      [u1, u2] = [u1 / massNorm, u2 / massNorm];
+      timeEigen += clock() - timer;
+      ++eigenSolves;
+    }
+    if (needCompliance)
+    {
+      timer = clock();
+      w1[] = stateStiffness^-1 * loadVector;
+      compliance = int2d(Th)(force * w2);
+      timeCompliance += clock() - timer;
+      ++complianceSolves;
+    }
+    energy = -alphaEig * lambda1 + alphaComp * compliance
+      + int2d(Th)(0.5 * epsilon * grad(phi)' * grad(phi) + (0.5 / epsilon) * phi * (1.0 - phi));
+    if (makeTrial)
+    {
+      if (energy <= oldEnergy - armijoSigma * dissipation)
+      {
+        acceptedFactor = requestedFactor;
+        trialStatus = 1;
+        extrapAccepted = true;
+        break;
+      }
+      trialStatus = -1;
+      makeTrial = false;
+      phi = predictor;
+      continue;
+    }
+
+    if (energy <= oldEnergy - armijoSigma * backtrackStep * dissipation)
+    {
+      acceptedFactor = backtrackStep;
+      break;
+    }
+    if (backtrackCount >= maxBacktracks)
+    {
+      cerr << "Backtracking failed at step " << step + 1
+        << ": maximum contractions reached; no candidate accepted." << endl;
+      exit(1);
+    }
+    real nextBacktrackStep = backtrackFactor * backtrackStep;
+    if (nextBacktrackStep <= 0.0 || nextBacktrackStep >= backtrackStep)
+    {
+      cerr << "Backtracking stagnated at step " << step + 1
+        << ": the step cannot decrease; no candidate accepted." << endl;
+      exit(1);
+    }
+    backtrackStep = nextBacktrackStep;
+    ++backtrackCount;
+    // Both segment endpoints are feasible, so no projection is needed here.
+    phi[] = phiOld[] + backtrackStep * direction[];
+  }
+  extrapMemory = (extrapAccepted ? min(extrapCap, extrapIncrease * requestedFactor)
+    : 1.0 + extrapDecrease * (requestedFactor - 1.0));
+  // Exclude nested state work from the safeguard interval.
+  timeSafeguard = clock() - safeguardStart - (timeAssembly + timeEigen + timeCompliance);
+
+  timer = clock();
+  ++step;
+  bool stopBelow = (normalizedDissipation <= dissipationTol);
+  if (stopBelow) ++stopCount; else stopCount = 0;
+  real volumeError = weightedVolume(phi[], volumeWeight) - targetVolume;
+  real energyDrop = oldEnergy - energy;
+  oldEnergy = energy;
+  timeDiagnostics = clock() - timer;
+  timer = clock();
+  cout << "step=" << step << " energy=" << energy << " R=" << normalizedDissipation
+    << " volume_error=" << volumeError << " factor=" << acceptedFactor << endl;
+
+  if (vtkEvery > 0)
+  {
+    if (step % vtkEvery == 0)
+      savevtk("rho_iter_" + step + ".vtk", Th, phi, dataname = "rho", order = vtkOrder, bin = 0);
+  }
+  stateFile << step << " " << energy << " ";
+  if (needCompliance) stateFile << compliance; else stateFile << "nan";
+  stateFile << " ";
+  if (needEigen) stateFile << lambda1; else stateFile << "nan";
+  stateFile << " " << volumeError << " " << phi[].min << " " << phi[].max
+    << " " << needEigen << " " << needCompliance << endl;
+  convergenceFile << step << " " << energyDrop << " " << dissipation << " "
+    << normalizedDissipation << " " << stopBelow << " " << stopCount << endl;
+  extrapolationFile << step << " " << requestedFactor << " " << acceptedFactor << " "
+    << trialStatus << " " << S0 << " " << S1 << " "
+    << backtrackStep << " " << backtrackCount << endl;
+  eigenvalueFile << step << " ";
+  if (needEigen)
+    eigenvalueFile << lambda1 << " " << lambda2 << " " << lambda2 - lambda1
+      << " " << (lambda2 - lambda1) / lambda1 << endl;
+  else eigenvalueFile << "nan nan nan nan" << endl;
+  eigenvalueFile.flush;
+  timeIO = clock() - timer;
+  real totalTime = clock() - iterationStart;
+  cumulativeTime += totalTime;
+  real timeState = timeEigen + timeCompliance;
+  real timePredictor = timeSensitivity + timePhase;
+  real measuredTime = timeAssembly + timeState + timePredictor + timeSafeguard + timeDiagnostics + timeIO;
+  real otherTime = max(totalTime - measuredTime, 0.0);
+  real timeDiagnosticsIO = timeDiagnostics + timeIO + otherTime;
+  timingFile << step << " " << timeAssembly << " " << timeState
+    << " " << timePredictor << " " << timeSafeguard << " " << timeDiagnosticsIO
+    << " " << timeEigen << " " << timeCompliance << " " << timeSensitivity
+    << " " << timePhase << " " << timeDiagnostics << " " << timeIO << " " << otherTime
+    << " " << totalTime << " " << cumulativeTime << " " << stateEvaluations
+    << " " << eigenSolves << " " << complianceSolves << endl;
+  timingFile.flush;
+}
+
+// Export the last accepted P1 fields without thresholding or another solve.
+savevtk("rho_final.vtk", Th, phi, dataname = "rho", order = vtkOrder, bin = 0);
+ofstream phaseCoefficients("phi_final.txt");
+phaseCoefficients.precision(17);
+phaseCoefficients << phi[].n << endl;
+for (int i = 0; i < phi[].n; ++i) phaseCoefficients << phi[][i] << endl;
+ofstream finalState("final_state.txt");
+finalState.precision(17);
+finalState << "steps " << step << endl;
+finalState << "energy " << energy << endl;
+if (needEigen) finalState << "lambda1 " << lambda1 << endl;
+if (needCompliance) finalState << "compliance " << compliance << endl;
+finalState << "volume_error " << weightedVolume(phi[], volumeWeight) - targetVolume << endl;
+finalState << "termination " << (zeroIncrement ? "zero_predictor_increment"
+  : (stopCount >= 3 ? "dissipation_converged" : "max_steps_reached")) << endl;
+cout << "Finished after " << step << " accepted steps." << endl;
