@@ -1,0 +1,6 @@
+steps 78
+energy 6.6755217763220855
+lambda1 0.00040937298815665641
+compliance 1190.1037219955347
+volume_error 2.2204460492503131e-16
+termination dissipation_converged
